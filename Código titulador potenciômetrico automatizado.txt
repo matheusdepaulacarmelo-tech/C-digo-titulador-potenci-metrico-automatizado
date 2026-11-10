@@ -1,0 +1,1614 @@
+/*
+  TITULADOR POTENCIOMÉTRICO AUTOMATIZADO
+
+  Plataforma:
+  - ESP32 DevKit ou C3
+  - ADS1115
+  - LMC6482
+  - DS18B20
+  - A4988
+  - Motor de passo
+  - Bomba de seringa
+
+  Funções:
+  - Aquisição potenciométrica
+  - Medição de temperatura
+  - Controle da bomba de seringa
+  - Controle da sequência de titulação
+  - Interface web
+  - Registro de volume, potencial, temperatura e tempo
+  - Exportação dos dados em CSV
+*/
+
+#include <Wire.h>
+#include <Adafruit_ADS1X15.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <WiFi.h>
+#include <WebServer.h>
+
+// ======================================================
+// PINOS
+// ======================================================
+
+// I2C
+#define PIN_SDA 21
+#define PIN_SCL 22
+
+// Sensor DS18B20
+#define PIN_DS18B20 4
+
+// Driver A4988
+#define PIN_ENABLE 18
+#define PIN_STEP   5
+#define PIN_DIR    17
+
+// ======================================================
+// OBJETOS
+// ======================================================
+
+Adafruit_ADS1115 ads;
+
+OneWire oneWire(PIN_DS18B20);
+DallasTemperature sensorTemperatura(&oneWire);
+
+WebServer server(80);
+
+// ======================================================
+// WI-FI
+// ======================================================
+
+// O ESP32 cria sua própria rede Wi-Fi
+const char* ssid = "Titulador_ESP32";
+const char* senha = "titulador";
+
+// ======================================================
+// PARÂMETROS DO SISTEMA DE DOSAGEM
+// ======================================================
+
+/*
+  Este valor deverá ser substituído pelo valor obtido
+  experimentalmente durante a calibração da bomba.
+
+  Exemplo:
+  1000 passos = 1 mL
+*/
+
+float passosPorMl = 1000.0;
+
+// Tempo do pulso enviado ao A4988
+const unsigned int tempoPulsoUs = 800;
+
+// Sentido utilizado para dispensar o titulante
+const int sentidoDosagem = HIGH;
+
+// ======================================================
+// PARÂMETROS DA TITULAÇÃO
+// ======================================================
+
+// Valores iniciais. Podem ser alterados pela interface web.
+
+float incrementoMl = 0.10;
+float volumeFinalMl = 10.00;
+
+// Tempo de homogeneização após cada adição
+unsigned long tempoHomogeneizacaoMs = 3000;
+
+// Parâmetros utilizados para avaliar a estabilização
+const unsigned long tempoMinEstabilizacaoMs = 3000;
+const unsigned long tempoMaxEstabilizacaoMs = 15000;
+const unsigned long intervaloEstabilizacaoMs = 500;
+
+const float limiteEstabilidadeMv = 0.50;
+const int numeroLeiturasEstaveis = 4;
+
+// ======================================================
+// CALIBRAÇÃO DO POTENCIAL
+// ======================================================
+
+/*
+  Permitem aplicar futuramente uma correção ao sinal
+  obtido pelo sistema de aquisição.
+*/
+
+float ganhoPotencial = 1.0;
+float offsetPotencialMv = 0.0;
+
+// ======================================================
+// ARMAZENAMENTO DOS DADOS
+// ======================================================
+
+const int MAX_PONTOS = 300;
+
+float volumes[MAX_PONTOS];
+float potenciais[MAX_PONTOS];
+float temperaturas[MAX_PONTOS];
+float tempos[MAX_PONTOS];
+
+int numeroPontos = 0;
+
+// ======================================================
+// VARIÁVEIS DE ESTADO
+// ======================================================
+
+bool titulacaoAtiva = false;
+bool titulacaoPausada = false;
+
+float volumeAcumulado = 0.0;
+
+float ultimoPotencialMv = 0.0;
+float ultimaTemperatura = 0.0;
+
+unsigned long tempoInicio = 0;
+
+enum EstadoSistema {
+  PARADO,
+  DOSANDO,
+  HOMOGENEIZANDO,
+  ESTABILIZANDO,
+  ADQUIRINDO,
+  FINALIZADO,
+  INTERROMPIDO
+};
+
+EstadoSistema estadoAtual = PARADO;
+
+// ======================================================
+// INTERFACE WEB
+// ======================================================
+
+const char paginaWeb[] PROGMEM = R"rawliteral(
+
+<!DOCTYPE html>
+
+<html>
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta name="viewport"
+content="width=device-width, initial-scale=1.0">
+
+<title>Titulador Potenciométrico</title>
+
+<style>
+
+body {
+  font-family: Arial, sans-serif;
+  margin: 20px;
+  background: #f5f5f5;
+}
+
+h1 {
+  text-align: center;
+}
+
+.painel {
+  max-width: 850px;
+  margin: auto;
+  background: white;
+  padding: 20px;
+  border-radius: 10px;
+}
+
+.dados {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 20px;
+}
+
+.caixa {
+  flex: 1;
+  min-width: 150px;
+  padding: 15px;
+  background: #eeeeee;
+  border-radius: 8px;
+  text-align: center;
+}
+
+.valor {
+  font-size: 24px;
+  font-weight: bold;
+}
+
+.controles {
+  margin-top: 20px;
+}
+
+input {
+  width: 100px;
+  margin: 5px;
+  padding: 5px;
+}
+
+button {
+  padding: 10px 15px;
+  margin: 5px;
+  cursor: pointer;
+}
+
+canvas {
+  width: 100%;
+  max-width: 800px;
+  height: 350px;
+  border: 1px solid #aaa;
+  margin-top: 20px;
+}
+
+</style>
+
+</head>
+
+<body>
+
+<div class="painel">
+
+<h1>Titulador Potenciométrico</h1>
+
+<div class="dados">
+
+<div class="caixa">
+Estado
+<div class="valor" id="estado">---</div>
+</div>
+
+<div class="caixa">
+Volume
+<div class="valor">
+<span id="volume">0.000</span> mL
+</div>
+</div>
+
+<div class="caixa">
+Potencial
+<div class="valor">
+<span id="potencial">0.0</span> mV
+</div>
+</div>
+
+<div class="caixa">
+Temperatura
+<div class="valor">
+<span id="temperatura">0.0</span> °C
+</div>
+</div>
+
+</div>
+
+<div class="controles">
+
+<h3>Parâmetros</h3>
+
+<label>
+Incremento (mL):
+<input
+type="number"
+id="incremento"
+value="0.10"
+step="0.01">
+</label>
+
+<br>
+
+<label>
+Volume final (mL):
+<input
+type="number"
+id="volumeFinal"
+value="10.0"
+step="0.1">
+</label>
+
+<br>
+
+<label>
+Homogeneização (s):
+<input
+type="number"
+id="homogeneizacao"
+value="3"
+step="1">
+</label>
+
+<br><br>
+
+<button onclick="iniciar()">
+Iniciar
+</button>
+
+<button onclick="pausar()">
+Pausar / Continuar
+</button>
+
+<button onclick="parar()">
+Parar
+</button>
+
+<button onclick="baixarCSV()">
+Baixar CSV
+</button>
+
+</div>
+
+<h3>Curva de titulação</h3>
+
+<canvas
+id="grafico"
+width="800"
+height="350">
+</canvas>
+
+</div>
+
+<script>
+
+function iniciar() {
+
+  const dados = new URLSearchParams();
+
+  dados.append(
+    "incremento",
+    document.getElementById("incremento").value
+  );
+
+  dados.append(
+    "volumeFinal",
+    document.getElementById("volumeFinal").value
+  );
+
+  dados.append(
+    "homogeneizacao",
+    document.getElementById("homogeneizacao").value
+  );
+
+  fetch("/iniciar", {
+    method: "POST",
+    headers: {
+      "Content-Type":
+      "application/x-www-form-urlencoded"
+    },
+    body: dados.toString()
+  });
+}
+
+function pausar() {
+  fetch("/pausar", {
+    method: "POST"
+  });
+}
+
+function parar() {
+  fetch("/parar", {
+    method: "POST"
+  });
+}
+
+function baixarCSV() {
+  window.location.href = "/csv";
+}
+
+async function atualizarDados() {
+
+  try {
+
+    const resposta =
+      await fetch("/dados");
+
+    const dados =
+      await resposta.json();
+
+    document.getElementById("estado").innerText =
+      dados.estado;
+
+    document.getElementById("volume").innerText =
+      dados.volume.toFixed(3);
+
+    document.getElementById("potencial").innerText =
+      dados.potencial.toFixed(2);
+
+    document.getElementById("temperatura").innerText =
+      dados.temperatura.toFixed(2);
+
+  }
+
+  catch(e) {}
+
+}
+
+async function atualizarGrafico() {
+
+  try {
+
+    const resposta =
+      await fetch("/curva");
+
+    const pontos =
+      await resposta.json();
+
+    desenharGrafico(pontos);
+
+  }
+
+  catch(e) {}
+
+}
+
+function desenharGrafico(pontos) {
+
+  const canvas =
+    document.getElementById("grafico");
+
+  const ctx =
+    canvas.getContext("2d");
+
+  const largura =
+    canvas.width;
+
+  const altura =
+    canvas.height;
+
+  ctx.clearRect(
+    0,
+    0,
+    largura,
+    altura
+  );
+
+  if (pontos.length < 2)
+    return;
+
+  const margem = 50;
+
+  const volumes =
+    pontos.map(p => p.v);
+
+  const potenciais =
+    pontos.map(p => p.e);
+
+  let minV =
+    Math.min(...volumes);
+
+  let maxV =
+    Math.max(...volumes);
+
+  let minE =
+    Math.min(...potenciais);
+
+  let maxE =
+    Math.max(...potenciais);
+
+  if (maxV == minV)
+    maxV = minV + 1;
+
+  if (maxE == minE)
+    maxE = minE + 1;
+
+  ctx.beginPath();
+
+  ctx.moveTo(
+    margem,
+    margem
+  );
+
+  ctx.lineTo(
+    margem,
+    altura - margem
+  );
+
+  ctx.lineTo(
+    largura - margem,
+    altura - margem
+  );
+
+  ctx.stroke();
+
+  ctx.font = "14px Arial";
+
+  ctx.fillText(
+    "Volume (mL)",
+    largura / 2 - 30,
+    altura - 10
+  );
+
+  ctx.save();
+
+  ctx.translate(
+    15,
+    altura / 2
+  );
+
+  ctx.rotate(
+    -Math.PI / 2
+  );
+
+  ctx.fillText(
+    "Potencial (mV)",
+    -45,
+    0
+  );
+
+  ctx.restore();
+
+  ctx.beginPath();
+
+  pontos.forEach(
+    (p, i) => {
+
+      const x =
+        margem +
+        (p.v - minV) /
+        (maxV - minV) *
+        (largura - 2 * margem);
+
+      const y =
+        altura -
+        margem -
+        (p.e - minE) /
+        (maxE - minE) *
+        (altura - 2 * margem);
+
+      if (i == 0)
+        ctx.moveTo(x, y);
+      else
+        ctx.lineTo(x, y);
+
+    }
+  );
+
+  ctx.stroke();
+
+}
+
+setInterval(
+  atualizarDados,
+  1000
+);
+
+setInterval(
+  atualizarGrafico,
+  2000
+);
+
+</script>
+
+</body>
+
+</html>
+
+)rawliteral";
+
+// ======================================================
+// FUNÇÕES AUXILIARES
+// ======================================================
+
+String nomeEstado() {
+
+  if (titulacaoPausada)
+    return "PAUSADO";
+
+  switch (estadoAtual) {
+
+    case PARADO:
+      return "PARADO";
+
+    case DOSANDO:
+      return "DOSANDO";
+
+    case HOMOGENEIZANDO:
+      return "HOMOGENEIZANDO";
+
+    case ESTABILIZANDO:
+      return "ESTABILIZANDO";
+
+    case ADQUIRINDO:
+      return "ADQUIRINDO";
+
+    case FINALIZADO:
+      return "FINALIZADO";
+
+    case INTERROMPIDO:
+      return "INTERROMPIDO";
+  }
+
+  return "---";
+}
+
+// ======================================================
+// CONTROLE DO DRIVER
+// ======================================================
+
+void habilitarMotor() {
+
+  // ENABLE do A4988 é ativo em nível baixo
+
+  digitalWrite(
+    PIN_ENABLE,
+    LOW
+  );
+}
+
+void desabilitarMotor() {
+
+  digitalWrite(
+    PIN_ENABLE,
+    HIGH
+  );
+}
+
+// ======================================================
+// LEITURA DO POTENCIAL
+// ======================================================
+
+float lerPotencialMv() {
+
+  const int numeroLeituras = 10;
+
+  float soma = 0;
+
+  for (int i = 0;
+       i < numeroLeituras;
+       i++) {
+
+    int16_t leitura =
+      ads.readADC_Differential_0_1();
+
+    float tensao =
+      ads.computeVolts(leitura);
+
+    soma +=
+      tensao * 1000.0;
+
+    delay(5);
+  }
+
+  float potencial =
+    soma / numeroLeituras;
+
+  potencial =
+    potencial *
+    ganhoPotencial +
+    offsetPotencialMv;
+
+  return potencial;
+}
+
+// ======================================================
+// LEITURA DA TEMPERATURA
+// ======================================================
+
+float lerTemperatura() {
+
+  sensorTemperatura.requestTemperatures();
+
+  return
+    sensorTemperatura.getTempCByIndex(0);
+}
+
+// ======================================================
+// PAUSA
+// ======================================================
+
+void aguardarEnquantoPausado() {
+
+  while (
+    titulacaoPausada &&
+    titulacaoAtiva
+  ) {
+
+    desabilitarMotor();
+
+    server.handleClient();
+
+    delay(10);
+  }
+}
+
+// ======================================================
+// ESPERA SEM BLOQUEAR A INTERFACE
+// ======================================================
+
+bool esperarResponsivo(
+  unsigned long tempoMs
+) {
+
+  unsigned long tempoDecorrido = 0;
+
+  unsigned long anterior =
+    millis();
+
+  while (
+    tempoDecorrido < tempoMs &&
+    titulacaoAtiva
+  ) {
+
+    server.handleClient();
+
+    if (titulacaoPausada) {
+
+      aguardarEnquantoPausado();
+
+      anterior =
+        millis();
+
+      continue;
+    }
+
+    unsigned long agora =
+      millis();
+
+    tempoDecorrido +=
+      agora - anterior;
+
+    anterior =
+      agora;
+
+    delay(2);
+  }
+
+  return titulacaoAtiva;
+}
+
+// ======================================================
+// DOSAGEM
+// ======================================================
+
+float dosarVolume(
+  float volumeDesejado
+) {
+
+  estadoAtual = DOSANDO;
+
+  long passosDesejados =
+    lround(
+      volumeDesejado *
+      passosPorMl
+    );
+
+  long passosExecutados = 0;
+
+  digitalWrite(
+    PIN_DIR,
+    sentidoDosagem
+  );
+
+  habilitarMotor();
+
+  for (
+    long i = 0;
+    i < passosDesejados;
+    i++
+  ) {
+
+    if (!titulacaoAtiva)
+      break;
+
+    if (titulacaoPausada) {
+
+      desabilitarMotor();
+
+      aguardarEnquantoPausado();
+
+      if (!titulacaoAtiva)
+        break;
+
+      habilitarMotor();
+    }
+
+    digitalWrite(
+      PIN_STEP,
+      HIGH
+    );
+
+    delayMicroseconds(
+      tempoPulsoUs
+    );
+
+    digitalWrite(
+      PIN_STEP,
+      LOW
+    );
+
+    delayMicroseconds(
+      tempoPulsoUs
+    );
+
+    passosExecutados++;
+
+    // Mantém a interface responsiva
+    if (
+      passosExecutados % 25 == 0
+    ) {
+
+      server.handleClient();
+    }
+  }
+
+  desabilitarMotor();
+
+  return
+    passosExecutados /
+    passosPorMl;
+}
+
+// ======================================================
+// ESTABILIZAÇÃO DO POTENCIAL
+// ======================================================
+
+bool aguardarEstabilizacao() {
+
+  estadoAtual =
+    ESTABILIZANDO;
+
+  float potencialAnterior =
+    lerPotencialMv();
+
+  int leiturasEstaveis = 0;
+
+  unsigned long tempoAtivo = 0;
+
+  unsigned long ultimoInstante =
+    millis();
+
+  unsigned long ultimaLeitura =
+    millis();
+
+  while (
+    titulacaoAtiva &&
+    tempoAtivo <
+    tempoMaxEstabilizacaoMs
+  ) {
+
+    server.handleClient();
+
+    if (titulacaoPausada) {
+
+      aguardarEnquantoPausado();
+
+      ultimoInstante =
+        millis();
+
+      ultimaLeitura =
+        millis();
+
+      continue;
+    }
+
+    unsigned long agora =
+      millis();
+
+    tempoAtivo +=
+      agora - ultimoInstante;
+
+    ultimoInstante =
+      agora;
+
+    if (
+      agora - ultimaLeitura >=
+      intervaloEstabilizacaoMs
+    ) {
+
+      ultimaLeitura =
+        agora;
+
+      float potencialAtual =
+        lerPotencialMv();
+
+      float diferenca =
+        fabs(
+          potencialAtual -
+          potencialAnterior
+        );
+
+      if (
+        diferenca <=
+        limiteEstabilidadeMv
+      ) {
+
+        leiturasEstaveis++;
+      }
+
+      else {
+
+        leiturasEstaveis = 0;
+      }
+
+      potencialAnterior =
+        potencialAtual;
+
+      if (
+        tempoAtivo >=
+        tempoMinEstabilizacaoMs &&
+        leiturasEstaveis >=
+        numeroLeiturasEstaveis
+      ) {
+
+        return true;
+      }
+    }
+
+    delay(2);
+  }
+
+  /*
+    Caso o limite de tempo seja atingido,
+    a sequência continua com a aquisição.
+  */
+
+  return titulacaoAtiva;
+}
+
+// ======================================================
+// REGISTRO DE UM PONTO
+// ======================================================
+
+void registrarPonto() {
+
+  estadoAtual =
+    ADQUIRINDO;
+
+  ultimoPotencialMv =
+    lerPotencialMv();
+
+  ultimaTemperatura =
+    lerTemperatura();
+
+  float instante =
+    (millis() - tempoInicio)
+    / 1000.0;
+
+  if (
+    numeroPontos <
+    MAX_PONTOS
+  ) {
+
+    volumes[numeroPontos] =
+      volumeAcumulado;
+
+    potenciais[numeroPontos] =
+      ultimoPotencialMv;
+
+    temperaturas[numeroPontos] =
+      ultimaTemperatura;
+
+    tempos[numeroPontos] =
+      instante;
+
+    numeroPontos++;
+  }
+
+  // Envio também pela porta serial em formato CSV
+
+  Serial.print(
+    volumeAcumulado,
+    4
+  );
+
+  Serial.print(",");
+
+  Serial.print(
+    ultimoPotencialMv,
+    3
+  );
+
+  Serial.print(",");
+
+  Serial.print(
+    ultimaTemperatura,
+    2
+  );
+
+  Serial.print(",");
+
+  Serial.println(
+    instante,
+    2
+  );
+}
+
+// ======================================================
+// INICIAR TITULAÇÃO
+// ======================================================
+
+void iniciarTitulacao() {
+
+  numeroPontos = 0;
+
+  volumeAcumulado = 0;
+
+  titulacaoPausada = false;
+
+  titulacaoAtiva = true;
+
+  estadoAtual =
+    ADQUIRINDO;
+
+  tempoInicio =
+    millis();
+
+  /*
+    Registra o primeiro ponto antes da
+    adição de titulante, correspondente
+    a V = 0 mL.
+  */
+
+  registrarPonto();
+}
+
+// ======================================================
+// FINALIZAÇÃO
+// ======================================================
+
+void finalizarTitulacao() {
+
+  titulacaoAtiva = false;
+
+  titulacaoPausada = false;
+
+  desabilitarMotor();
+
+  estadoAtual =
+    FINALIZADO;
+}
+
+// ======================================================
+// INTERRUPÇÃO
+// ======================================================
+
+void interromperTitulacao() {
+
+  titulacaoAtiva = false;
+
+  titulacaoPausada = false;
+
+  desabilitarMotor();
+
+  estadoAtual =
+    INTERROMPIDO;
+}
+
+// ======================================================
+// CICLO PRINCIPAL DA TITULAÇÃO
+// ======================================================
+
+void executarCicloTitulacao() {
+
+  if (
+    !titulacaoAtiva ||
+    titulacaoPausada
+  )
+    return;
+
+  if (
+    volumeAcumulado >=
+    volumeFinalMl
+  ) {
+
+    finalizarTitulacao();
+
+    return;
+  }
+
+  float volumeRestante =
+    volumeFinalMl -
+    volumeAcumulado;
+
+  float proximoIncremento =
+    incrementoMl;
+
+  if (
+    proximoIncremento >
+    volumeRestante
+  ) {
+
+    proximoIncremento =
+      volumeRestante;
+  }
+
+  // -------------------------
+  // DOSAGEM
+  // -------------------------
+
+  float volumeReal =
+    dosarVolume(
+      proximoIncremento
+    );
+
+  volumeAcumulado +=
+    volumeReal;
+
+  if (!titulacaoAtiva)
+    return;
+
+  // -------------------------
+  // HOMOGENEIZAÇÃO
+  // -------------------------
+
+  /*
+    O agitador magnético pode permanecer
+    ligado externamente durante o ensaio.
+    Aqui é aguardado apenas o período
+    definido para homogeneização.
+  */
+
+  estadoAtual =
+    HOMOGENEIZANDO;
+
+  if (
+    !esperarResponsivo(
+      tempoHomogeneizacaoMs
+    )
+  )
+    return;
+
+  // -------------------------
+  // ESTABILIZAÇÃO
+  // -------------------------
+
+  if (
+    !aguardarEstabilizacao()
+  )
+    return;
+
+  // -------------------------
+  // AQUISIÇÃO
+  // -------------------------
+
+  registrarPonto();
+
+  // -------------------------
+  // VERIFICAÇÃO FINAL
+  // -------------------------
+
+  if (
+    volumeAcumulado >=
+    volumeFinalMl
+  ) {
+
+    finalizarTitulacao();
+  }
+}
+
+// ======================================================
+// ROTAS DA INTERFACE WEB
+// ======================================================
+
+void configurarServidor() {
+
+  // Página principal
+
+  server.on(
+    "/",
+    HTTP_GET,
+    []() {
+
+      server.send(
+        200,
+        "text/html",
+        paginaWeb
+      );
+    }
+  );
+
+  // ----------------------------------------------
+  // INICIAR
+  // ----------------------------------------------
+
+  server.on(
+    "/iniciar",
+    HTTP_POST,
+    []() {
+
+      if (
+        server.hasArg(
+          "incremento"
+        )
+      ) {
+
+        incrementoMl =
+          server.arg(
+            "incremento"
+          ).toFloat();
+      }
+
+      if (
+        server.hasArg(
+          "volumeFinal"
+        )
+      ) {
+
+        volumeFinalMl =
+          server.arg(
+            "volumeFinal"
+          ).toFloat();
+      }
+
+      if (
+        server.hasArg(
+          "homogeneizacao"
+        )
+      ) {
+
+        float segundos =
+          server.arg(
+            "homogeneizacao"
+          ).toFloat();
+
+        tempoHomogeneizacaoMs =
+          (unsigned long)
+          (segundos * 1000.0);
+      }
+
+      iniciarTitulacao();
+
+      server.send(
+        200,
+        "text/plain",
+        "OK"
+      );
+    }
+  );
+
+  // ----------------------------------------------
+  // PAUSAR / CONTINUAR
+  // ----------------------------------------------
+
+  server.on(
+    "/pausar",
+    HTTP_POST,
+    []() {
+
+      if (titulacaoAtiva) {
+
+        titulacaoPausada =
+          !titulacaoPausada;
+
+        if (
+          titulacaoPausada
+        ) {
+
+          desabilitarMotor();
+        }
+      }
+
+      server.send(
+        200,
+        "text/plain",
+        "OK"
+      );
+    }
+  );
+
+  // ----------------------------------------------
+  // PARAR
+  // ----------------------------------------------
+
+  server.on(
+    "/parar",
+    HTTP_POST,
+    []() {
+
+      interromperTitulacao();
+
+      server.send(
+        200,
+        "text/plain",
+        "OK"
+      );
+    }
+  );
+
+  // ----------------------------------------------
+  // DADOS ATUAIS
+  // ----------------------------------------------
+
+  server.on(
+    "/dados",
+    HTTP_GET,
+    []() {
+
+      String json = "{";
+
+      json +=
+        "\"estado\":\"" +
+        nomeEstado() +
+        "\",";
+
+      json +=
+        "\"volume\":" +
+        String(
+          volumeAcumulado,
+          4
+        ) +
+        ",";
+
+      json +=
+        "\"potencial\":" +
+        String(
+          ultimoPotencialMv,
+          3
+        ) +
+        ",";
+
+      json +=
+        "\"temperatura\":" +
+        String(
+          ultimaTemperatura,
+          2
+        );
+
+      json += "}";
+
+      server.send(
+        200,
+        "application/json",
+        json
+      );
+    }
+  );
+
+  // ----------------------------------------------
+  // CURVA
+  // ----------------------------------------------
+
+  server.on(
+    "/curva",
+    HTTP_GET,
+    []() {
+
+      String json = "[";
+
+      for (
+        int i = 0;
+        i < numeroPontos;
+        i++
+      ) {
+
+        json += "{";
+
+        json +=
+          "\"v\":" +
+          String(
+            volumes[i],
+            4
+          );
+
+        json += ",";
+
+        json +=
+          "\"e\":" +
+          String(
+            potenciais[i],
+            3
+          );
+
+        json += "}";
+
+        if (
+          i <
+          numeroPontos - 1
+        ) {
+
+          json += ",";
+        }
+      }
+
+      json += "]";
+
+      server.send(
+        200,
+        "application/json",
+        json
+      );
+    }
+  );
+
+  // ----------------------------------------------
+  // CSV
+  // ----------------------------------------------
+
+  server.on(
+    "/csv",
+    HTTP_GET,
+    []() {
+
+      String csv =
+        "Volume_mL,"
+        "Potencial_mV,"
+        "Temperatura_C,"
+        "Tempo_s\n";
+
+      for (
+        int i = 0;
+        i < numeroPontos;
+        i++
+      ) {
+
+        csv +=
+          String(
+            volumes[i],
+            4
+          );
+
+        csv += ",";
+
+        csv +=
+          String(
+            potenciais[i],
+            3
+          );
+
+        csv += ",";
+
+        csv +=
+          String(
+            temperaturas[i],
+            2
+          );
+
+        csv += ",";
+
+        csv +=
+          String(
+            tempos[i],
+            2
+          );
+
+        csv += "\n";
+      }
+
+      server.sendHeader(
+        "Content-Disposition",
+        "attachment; "
+        "filename=titulacao.csv"
+      );
+
+      server.send(
+        200,
+        "text/csv",
+        csv
+      );
+    }
+  );
+
+  server.begin();
+}
+
+// ======================================================
+// SETUP
+// ======================================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  // ----------------------------------------------
+  // DRIVER
+  // ----------------------------------------------
+
+  pinMode(
+    PIN_ENABLE,
+    OUTPUT
+  );
+
+  pinMode(
+    PIN_STEP,
+    OUTPUT
+  );
+
+  pinMode(
+    PIN_DIR,
+    OUTPUT
+  );
+
+  desabilitarMotor();
+
+  digitalWrite(
+    PIN_STEP,
+    LOW
+  );
+
+  // ----------------------------------------------
+  // I2C
+  // ----------------------------------------------
+
+  Wire.begin(
+    PIN_SDA,
+    PIN_SCL
+  );
+
+  // ----------------------------------------------
+  // ADS1115
+  // ----------------------------------------------
+
+  if (
+    !ads.begin(0x48)
+  ) {
+
+    Serial.println(
+      "Erro ao iniciar ADS1115"
+    );
+
+    while (1) {
+      delay(100);
+    }
+  }
+
+  /*
+    GAIN_FOUR:
+    faixa diferencial aproximadamente
+    ±1,024 V.
+  */
+
+  ads.setGain(
+    GAIN_FOUR
+  );
+
+  // ----------------------------------------------
+  // DS18B20
+  // ----------------------------------------------
+
+  sensorTemperatura.begin();
+
+  // ----------------------------------------------
+  // WI-FI
+  // ----------------------------------------------
+
+  WiFi.mode(
+    WIFI_AP
+  );
+
+  WiFi.softAP(
+    ssid,
+    senha
+  );
+
+  Serial.println();
+
+  Serial.println(
+    "Rede Wi-Fi criada"
+  );
+
+  Serial.print(
+    "IP: "
+  );
+
+  Serial.println(
+    WiFi.softAPIP()
+  );
+
+  // ----------------------------------------------
+  // SERVIDOR
+  // ----------------------------------------------
+
+  configurarServidor();
+
+  // Cabeçalho para os dados enviados pela Serial
+
+  Serial.println(
+    "Volume_mL,"
+    "Potencial_mV,"
+    "Temperatura_C,"
+    "Tempo_s"
+  );
+}
+
+// ======================================================
+// LOOP
+// ======================================================
+
+void loop() {
+
+  server.handleClient();
+
+  if (
+    titulacaoAtiva &&
+    !titulacaoPausada
+  ) {
+
+    executarCicloTitulacao();
+  }
+
+  delay(2);
+}
